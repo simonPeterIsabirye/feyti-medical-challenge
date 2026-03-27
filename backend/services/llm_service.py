@@ -6,15 +6,19 @@ import re
 from typing import Any, Dict
 
 from dotenv import load_dotenv
-from openai import OpenAI
+import google.generativeai as genai
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 MAX_DOCUMENT_CHARS = int(os.getenv("MAX_DOCUMENT_CHARS", "15000"))
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(GEMINI_MODEL)
+else:
+    model = None
 
 
 class AnalysisError(Exception):
@@ -29,10 +33,11 @@ Return strict JSON with these keys only:
 - summary
 Rules:
 - title: short extracted or inferred title
-- author: extracted author if present, otherwise \"Unknown\"
+- author: extracted author if present, otherwise "Unknown"
 - main_content: 2-4 sentence description of the main body or key sections
 - summary: concise 3-5 sentence summary
 Do not include markdown fences.
+Return valid JSON only.
 """
 
 
@@ -43,41 +48,40 @@ def analyze_document(document_text: str) -> Dict[str, str]:
 
     clipped = cleaned[:MAX_DOCUMENT_CHARS]
 
-    if client is None:
+    if model is None:
         return _fallback_analysis(clipped)
 
     try:
-        response = client.responses.create(
-            model=OPENAI_MODEL,
-            input=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "Analyze this document text and return JSON only.\n\n"
-                        f"DOCUMENT:\n{clipped}"
-                    ),
-                },
-            ],
+        prompt = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"Analyze this document text and return JSON only.\n\n"
+            f"DOCUMENT:\n{clipped}"
         )
-        raw_text = response.output_text.strip()
+
+        response = model.generate_content(prompt)
+        raw_text = (response.text or "").strip()
         parsed = _parse_json(raw_text)
         return _normalize_analysis(parsed, clipped)
+
     except Exception as exc:
-        # Graceful fallback so the demo keeps working.
+        print(f"Gemini analysis failed: {exc}")
         return _fallback_analysis(clipped, extra_note=str(exc))
 
 
-
 def _parse_json(text: str) -> Dict[str, Any]:
+    cleaned = text.strip()
+
+    cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^```\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
     try:
-        return json.loads(text)
+        return json.loads(cleaned)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if not match:
             raise AnalysisError("The LLM did not return valid JSON.")
         return json.loads(match.group(0))
-
 
 
 def _normalize_analysis(data: Dict[str, Any], source_text: str) -> Dict[str, str]:
@@ -97,7 +101,6 @@ def _normalize_analysis(data: Dict[str, Any], source_text: str) -> Dict[str, str
         "main_content": main_content,
         "summary": summary,
     }
-
 
 
 def _fallback_analysis(text: str, extra_note: str | None = None) -> Dict[str, str]:
